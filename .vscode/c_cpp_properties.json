@@ -1,0 +1,26 @@
+{
+    "env": {
+      "myIncludePath": ["${workspaceFolder}\\cpp_functions",
+                        "C:\\Users\\Dani\\Documents\\Projects\\pydev_venv\\Lib\\site-packages\\pybind11\\include",
+                        "C:\\Program Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\\Include",
+                        "C:\\Users\\Dani\\Documents\\Cpp Projects\\Libraries\\opencv_410_dynamic\\include"]
+    },
+    "configurations": [
+      {
+        "name": "Win32",
+        "compilerPath": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.30.30705\\bin\\Hostx64\\x64\\cl.exe",
+        "intelliSenseMode": "windows-msvc-x64",
+        "includePath": ["${myIncludePath}"],
+        "defines": ["_WINDOWS"],
+        "compilerArgs": ["/EHsc /O2 /permissive- /Wall"],
+        "cStandard": "c99",
+        "cppStandard": "c++11",
+        "windowsSdkVersion": "10.0.20348.0",
+        "browse": {
+          "path": ["${myIncludePath}", "${workspaceFolder}"]
+        }
+      }
+    ],
+    "version": 4,
+    "enableConfigurationSquiggles": true
+  }
