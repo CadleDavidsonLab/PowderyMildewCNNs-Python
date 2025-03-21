@@ -1,0 +1,6 @@
+onnxruntime-directml == 1.18.1
+opencv-python
+tk
+msgpack
+msgpack-numpy
+openpyxl
