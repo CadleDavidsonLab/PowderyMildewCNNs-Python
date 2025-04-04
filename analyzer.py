@@ -1,10 +1,10 @@
 __author__ = "Dani Martinez"
-__copyright__ = "Copyright 2024, Moblanc Robotics & Cornell University"
+__copyright__ = "Copyright 2025, Moblanc Robotics & Cornell University"
 __credits__ = ["Dani Martinez"]
 __license__ = "Apache 2.0"
-__version__ = "1.0"
+__version__ = "0.5"
 __maintainer__ = "Dani Martinez"
-__email__ = "dmartinez@moblancrobotics.com"
+__email__ = "dani.martinez@moblancrobotics.com"
 __status__ = "Production"
 
 import time
