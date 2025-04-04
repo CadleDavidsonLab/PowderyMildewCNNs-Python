@@ -4,3 +4,4 @@ tk
 msgpack
 msgpack-numpy
 openpyxl
+pillow

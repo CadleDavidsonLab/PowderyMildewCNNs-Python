@@ -1,18 +1,32 @@
 # Blackbird Analyzer scripts
+[![Python 3.11](https://img.shields.io/badge/python-3.11_ONLY-red.svg)](https://www.python.org/downloads/release/python-31111/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
+
+
 This repository contains a set of Python-based scripts for Blackbird images analysis based on the original MATLAB scripts. The OpenCV library is used on some of the scripts found in this repository.
 
-The trained models must be converted to ONNX in order to be able to be used with the scripts in this repository. 
+The trained models must be converted to ONNX in order to be able to be used with the scripts in this repository. If you need to use any pre-trained model, contact the Grape Genetics Research Unit (GGRU) of USDA-ARS. In addition, contact Dani Martinez for the model conversion of your own MATLAB legacy models. In the **models** folder, there are two image classifier models: one is used to detect Powdery Mildew, and the other to detect spores presence. Both require Blackbird-taken images as input. For more questions, please contact GGRU.
 
->Contact Dani Martinez for the model conversion.
+> Use the "Issues" tab to publicly post any issue or question you might have about this repository.
 
->**NOTE:** The scripts were developed and tested on Python 3.11 for Windows 10/11. For Linux users, change "onnxruntime-directml" to "onnxruntime-gpu" in the **requirements.txt** file for CUDA acceleration.
+## Scripts
+The following list enumerates the scripts and tools that are packed within this repository.
+* **Analyzer:** The Analyzer script uses a previously trained CNN model to quantify disease from Blackbird experiment folders containing the stacked images. The script predicts the "Infection" score (0.0 to 1.0) for each sub-image which is a sub-division of the large sample image.
+* **Thresholder:** The Tresholder process the results obtained from the Analyzer script following a custom tresholding policy in order to deliver the final results in an Excel file.
+* **Labeler:** FUTURE WORK
+* **Trainer:** FUTURE WORK
+
+
 
 ## Installation steps
-Follow the following steps to install all required software required to correctly run the scripts in this repository.
+Strictly follow the following steps to install all required software required to correctly run the scripts in this repository.
 
 ### 1 - Install Python
-Download Python 3.11 from the official webpage: https://www.python.org/downloads/windows/ .<br />
+Download **Python 3.11** from the official webpage: https://www.python.org/downloads/windows/ .<br />
 Or [click here](https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe) to download it directly.
+
+> **IMPORTANT:** For the moment, these scripts required the exact version of Python 3.11 due to the Pybind11-compiled leaf masking function. Support for other Python versions may be added in the future.
 
 1. Start the installation by running the downloaded Python installer.
 2. Check the "Add python.exe to PATH".
@@ -41,7 +55,13 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 > **NOTE:** The created virtual enviroment will need to be activated every time you need to use the scripts from this repository.
 
-### 3 - Install dependencies
+### 3 - Download this repository
+In the left margin of this Github page, find the **Releases** section, and download the latest ZIP package with all the necessary files to run the scripts. Then, extract the files in a local folder (ex: C:\blackbird-analyzer).
+
+> **NOTE:** The analyzer script requires a compiled OpenCV library file in the **cpp_functions** folder. This file is not included in this code repository as it should be compiled by each user. Nevertheless, in order to "keep things easy", this library file has been included in the release package. In the future we might provide scripts to download and compile OpenCV since it is the correct way to do it.
+
+
+### 4 - Install dependencies
 The scripts found in this repository requires to install very specific Python packages as dependencies. These dependencies are listed in the "requirements.txt" file in the repository folder. The users can use this file to install them all at once by calling the following command: ```pip install -r requirements.txt```
 
 First of all, make sure to change your current directory in the Powershell terminal to the folder where the scripts are located by using the **"cd"** command.
@@ -94,54 +114,8 @@ Example usage:
 (blackbird_env) PS C:\blackbird-analyzer> python thresholder.py D:\stacked\test_experiment\results.msgpack -lo 0.2 -hi 0.8 -o .\output.xlsx
 ```
 
-This new tresholder script outputs different data compared to the original MATLAB script. For each timepoint and sample ID, there are three given values:
-* Absolute number of sub-images labeled as infected (INF)
-* Absolute number of sub-images labeled as clear (CLR)
-* Absolute number of total analyzed sub-images (ALL)
-
->**NOTE:** Users are reponsible for calculating any Infection ratios and other statistical metrics by using this data.
-
----
----
-
-## Annex
-
-This section contains technical information about the development of the methods found in this repository. **Users don't need to read this section.**
-
-### Exporting MATLAB models to ONNX
-
-Download the [ONNX Converter](https://es.mathworks.com/matlabcentral/fileexchange/67296-deep-learning-toolbox-converter-for-onnx-model-format?status=SUCCESS) add-on for MATLAB. Run the **dag2onnx.m** script on MATLAB for the model conversion. Then, check and validate its integrity with Netron. 
-
-```
-exportONNXNetwork(net2,"VitisNet.onnx",'BatchSize',1)
-```
-
-
-### Compiling C++ code with Pybind11
-
-**NOTE:** OpenCV C++ libs must be compiled dynamic/shared! Add opencv_world4xx.dll in the "cpp_functions" folder.
-
-Start vscode from Developer Command Prompt (x64 Native Tools Command Prompt for VS 2022)
-Go to project dir and run:
-```
-code .
-```
-
-Edit CMakeLists.txt file and set correct paths to "find_package".
-To find out PyBind11 include paths, run:
-```
-python -m pybind11 --includes
-```
-
-Use CMAKE
-```
-mkdir build
-cd build
-cmake ..
-cmake --build . --config Release --target leaf_masking
-cmake --install .
-```
-
-### Observations
-
-* ONNXRuntime-CUDA package is not supported on Windows. Instead, install the ONNXRuntime-DirectML package for GPU inference.
+This new tresholder script outputs different data compared to the original MATLAB script. For each timepoint and sample ID, there are four given values:
+* Percentage of infected-rated sub-images (%): INF / INF + CLR
+* Absolute number of sub-images labeled as infected (INF): ```"score" >= HIGH_TH```
+* Absolute number of sub-images labeled as clear (CLR): ```score < LOW_TH```
+* Absolute number of total analyzed sub-images (ALL) including the ones rated in between both given tresholds.
