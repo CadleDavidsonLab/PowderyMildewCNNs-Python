@@ -1,0 +1,8 @@
+onnxruntime-gpu
+onnx
+numpy
+opencv-python-headless
+msgpack
+msgpack-numpy
+openpyxl
+pillow

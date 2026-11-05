@@ -85,6 +85,58 @@ For example:
 
 When the graphical user interface (GUI) is shown, the Powershell terminal will remain blocked until the window is closed.
 
+Each sample image is cut into 224x224 sub-images that are classified in batches on the GPU, while the next images are loaded and masked in parallel on the CPU. The following optional arguments control how the analysis runs:
+
+```
+usage: analyzer.py [-h] [-g <IDS>] [--cpu] [-b <N>] [-l <N>] <ONNX_MODEL>
+
+  -g <IDS>, --gpus <IDS>      Comma-separated DirectML GPU ids to run the analysis on, e.g. 0,1 (default: 0)
+  --cpu                       Run the analysis on the CPU instead of the GPU(s)
+  -b <N>, --batch-size <N>    Sub-images classified per inference run (default: 64)
+  -l <N>, --loaders <N>       Image loading/masking threads per device (default: 2)
+```
+
+To use several GPUs, list their ids. One worker process is started per GPU and the sample images are shared between them:
+```
+(blackbird_env) PS C:\blackbird-analyzer> python analyzer.py models\Hyphal2019Net2.onnx --gpus 0,1
+```
+
+On Windows, GPU ids follow the DirectX adapter order (usually the order in the Windows Task Manager "Performance" tab). If a GPU runs out of memory, lower the batch size. To find the best batch size for a given GPU, run `python test\benchmark_batching.py <MODEL> <IMAGE> --gpu 0`.
+
+>**NOTE:** Models exported from MATLAB with a fixed batch size of 1 are converted automatically at load time to accept batches (requires the `onnx` package from requirements.txt).
+
+### Analyzer on Linux / HPC (no GUI)
+The analyzer can also run without the GUI on Linux, e.g. on an HPC cluster with NVIDIA GPUs. On systems where the compiled leaf masking module (Windows, Python 3.11) can't be loaded, the pure Python implementation in `leaf_mask.py` is used instead, so any recent Python 3 version works.
+
+Install the Linux dependencies in a virtual environment (`onnxruntime-gpu` replaces `onnxruntime-directml`, and must match the CUDA/cuDNN versions available on the cluster, see the [ONNX Runtime CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)):
+```
+python3 -m venv ~/blackbird_env
+source ~/blackbird_env/bin/activate
+pip install -r requirements-linux.txt
+```
+
+Then pass one or more experiment folders with `--exp`. Results are written to `results.msgpack` inside each experiment folder, the same as with the GUI, and experiments that already have results are skipped unless `--overwrite` is given:
+```
+python analyzer.py models/SporeNet3.onnx --exp /path/to/experiment1 /path/to/experiment2 --gpus 0,1
+```
+
+Example Slurm job using every GPU allocated to it (`--gpus all` reads `CUDA_VISIBLE_DEVICES`, set by Slurm):
+```bash
+#!/bin/bash
+#SBATCH --job-name=blackbird
+#SBATCH --gres=gpu:2
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+
+module load cuda cudnn          # Module names depend on the cluster
+source ~/blackbird_env/bin/activate
+cd ~/PowderyMildewCNNs-Python
+python analyzer.py models/SporeNet3.onnx --exp /path/to/experiment --gpus all --loaders 3
+```
+
+Request about `--loaders` CPU cores per GPU (plus one), since image loading and leaf masking run on the CPU. The script exits with a non-zero code if any experiment fails.
+
 >**IMPORTANT:**
 > In order to run the models on the GPU (DirectML), you need to have Windows 11 or Windows 10 with the latest updates installed in your system.
 

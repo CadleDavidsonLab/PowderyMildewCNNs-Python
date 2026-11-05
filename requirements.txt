@@ -1,4 +1,5 @@
 onnxruntime-directml == 1.18.1
+onnx
 opencv-python
 tk
 msgpack
