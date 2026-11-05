@@ -15,6 +15,7 @@ The trained models must be converted to ONNX in order to be able to be used with
 The following list enumerates the scripts and tools that are packed within this repository.
 * **Analyzer:** The Analyzer script uses a previously-trained CNN model to quantify disease from Blackbird experiment folders containing the stacked images. The script predicts the "Infection" score (0.0 to 1.0) for each sub-image which is a sub-division of the large sample image.
 * **Thresholder:** The Thresholder processes the results obtained from the Analyzer script following a custom thresholding policy in order to deliver the final results in an Excel file.
+* **Summarizer:** The Summarizer collects the results of many experiments (and several models, e.g. sporulation and hyphae) into a single CSV table with one row per sample, including a combined severity from the union of the models' infected areas.
 * **Labeler:** FUTURE WORK
 * **Trainer:** FUTURE WORK
 
@@ -119,10 +120,12 @@ When the graphical user interface (GUI) is shown, the Powershell terminal will r
 Each sample image is cut into 224x224 sub-images that are classified in batches on the GPU, while the next images are loaded and masked in parallel on the CPU. The following optional arguments control how the analysis runs:
 
 ```
-usage: analyzer.py [-h] [-e <EXP_DIR> [<EXP_DIR> ...]] [--overwrite] [-g <IDS>] [--cpu] [-b <N>] [-l <N>] <ONNX_MODEL>
+usage: analyzer.py [-h] [-e <EXP_DIR> ...] [-r <REPO_DIR> ...] [--overwrite] [-g <IDS>] [--cpu] [-b <N>] [-l <N>] <ONNX_MODEL> [<ONNX_MODEL> ...]
 
+  <ONNX_MODEL> ...                        One model for the GUI; one or more models with --exp/--repo
   -e <EXP_DIR> ..., --exp <EXP_DIR> ...   Experiment folder(s) to analyze without the GUI (see Linux / HPC below)
-  --overwrite                             With --exp, overwrite existing results instead of skipping the experiment
+  -r <REPO_DIR> ..., --repo <REPO_DIR> .. Folder(s) containing experiment folders, all analyzed without the GUI
+  --overwrite                             With --exp/--repo, redo models that already have results instead of skipping them
   -g <IDS>, --gpus <IDS>                  Comma-separated GPU ids, e.g. 0,1, or 'all' for every GPU in CUDA_VISIBLE_DEVICES (default: 0)
   --cpu                                   Run the analysis on the CPU instead of the GPU(s)
   -b <N>, --batch-size <N>                Sub-images classified per inference run (default: 64)
@@ -153,10 +156,15 @@ source ~/blackbird_env/bin/activate
 pip install -r requirements-linux.txt
 ```
 
-Then pass one or more experiment folders with `--exp`. Results are written to `results.msgpack` inside each experiment folder, the same as with the GUI, and experiments that already have results are skipped unless `--overwrite` is given:
+Then pass one or more experiment folders with `--exp`, or a folder that contains many experiments with `--repo`:
 ```
 python analyzer.py models/SporeNet3.onnx --exp /path/to/experiment1 /path/to/experiment2 --gpus 0,1
+python analyzer.py models/SporeNet3.onnx models/Hyphal2019Net2.onnx --repo /path/to/repository --gpus 0,1
 ```
+* Without the GUI, the results of each model are written to `results_<MODEL_NAME>.msgpack` inside each experiment folder (e.g. `results_SporeNet3.msgpack`), so the results of different models don't overwrite each other. The format is the same as the GUI's `results.msgpack`, and the Thresholder works with either.
+* When several models are given, each image is loaded and masked only once and its sub-images are classified by all the models. This is faster than running the models separately, and all the models score exactly the same sub-images (needed for the [union severity](#summarizer)).
+* Models that already have results in an experiment are skipped unless `--overwrite` is given, so an interrupted run can simply be started again and it continues where it stopped.
+* Sub-folders that are not valid experiments are reported and skipped, and the run continues with the next experiment.
 
 Example Slurm job using every GPU allocated to it (`--gpus all` reads `CUDA_VISIBLE_DEVICES`, set by Slurm):
 ```bash
@@ -170,13 +178,14 @@ Example Slurm job using every GPU allocated to it (`--gpus all` reads `CUDA_VISI
 module load cuda cudnn          # Module names depend on the cluster
 source ~/blackbird_env/bin/activate
 cd ~/PowderyMildewCNNs-Python
-python analyzer.py models/SporeNet3.onnx --exp /path/to/experiment --gpus all --loaders 3
+python analyzer.py models/SporeNet3.onnx models/Hyphal2019Net2.onnx --repo /path/to/repository --gpus all --loaders 3
+python summarize.py /path/to/repository -o /path/to/repository/summary.csv
 ```
 
 Request about `--loaders` CPU cores per GPU (plus one), since image loading and leaf masking run on the CPU. The script exits with a non-zero code if any experiment fails.
 
 ### Results file
-`results.msgpack` is a [MessagePack](https://msgpack.org/) file with the score maps of all samples, nested by timepoint and tray: `results[timepoint][tray][sample_number - 1]`. Each entry is:
+`results.msgpack` (GUI) and `results_<MODEL_NAME>.msgpack` (`--exp`/`--repo`) are [MessagePack](https://msgpack.org/) files with the score maps of all samples, nested by timepoint and tray: `results[timepoint][tray][sample_number - 1]`. Each entry is:
 * `None` if there is no image for that sample number.
 * `[sample_id, score_map]` otherwise, where `sample_id` is the image filename without extension, and `score_map` is a 2D `float32` array (one value per sub-image, e.g. 24x36) with the "Infected" probability, or NaN for sub-images that were not analyzed. `score_map` is `None` if no leaf was found in the image.
 
@@ -256,8 +265,36 @@ Example usage:
 (blackbird_env) PS C:\blackbird-analyzer> python thresholder.py D:\stacked\test_experiment\results.msgpack -lo 0.2 -hi 0.8 -o .\output.xlsx
 ```
 
-This new thresholder script outputs different data compared to the original MATLAB script. For each timepoint and sample ID, there are four given values:
+The thresholder works with both `results.msgpack` (GUI) and `results_<MODEL_NAME>.msgpack` (`--exp`/`--repo`) files. This new thresholder script outputs different data compared to the original MATLAB script. For each timepoint and sample ID, there are four given values:
 * Percentage of infected-rated sub-images (%): INF / INF + CLR
 * Absolute number of sub-images labeled as infected (INF): ```"score" >= HIGH_TH```
 * Absolute number of sub-images labeled as clear (CLR): ```score < LOW_TH```
 * Absolute number of total analyzed sub-images (ALL) including the ones rated in between both given thresholds.
+
+### Summarizer
+The summarizer collects the `results_<MODEL_NAME>.msgpack` files of one or many experiments into a single CSV table, ready for R, pandas or Excel. It takes repository folders (containing experiment folders) or experiment folders:
+
+```
+usage: summarize.py [-h] [-o <OUT_CSV>] [-m <MODEL_NAME> ...] [-u <MODEL_NAME> ...] [-lo <LOW_TH>] [-hi <HIGH_TH>] <DIR> [<DIR> ...]
+
+  -o <OUT_CSV>, --out <OUT_CSV>          Path of the resulting CSV file (default: summary.csv)
+  -m <MODEL_NAME> ..., --models ...      Models to include, by name (default: all models found)
+  -u <MODEL_NAME> ..., --union ...       Models combined in the union severity (default: all included models, if two or more)
+  -lo <LOW_TH>, --low <LOW_TH>           Sub-images with a score below this are clear (default: 0.5)
+  -hi <HIGH_TH>, --high <HIGH_TH>        Sub-images with a score equal or above this are infected (default: 0.5)
+```
+
+Example, after analyzing a repository with both models:
+```
+python summarize.py /path/to/repository -o summary.csv
+```
+
+The table has one row per sample image, with its metadata (`experiment`, `timepoint` folder name, `date`, `tray`, `sample_number`, `sample_id` = filename without extension), and for each model:
+* `<MODEL>_analyzed`: number of analyzed (on-leaf) sub-images.
+* `<MODEL>_infected` / `<MODEL>_clear`: sub-images with `score >= HIGH_TH` / `score < LOW_TH`.
+* `<MODEL>_pct_infected`: `infected / (infected + clear) * 100`, the same percentage as the Thresholder (empty if there is nothing to rate, e.g. no leaf found).
+* `<MODEL>_mean_score`: mean score of the analyzed sub-images.
+
+When there are two or more models (e.g. `SporeNet3` for sporulation and `Hyphal2019Net2` for hyphae), the **union severity** combines them: a sub-image counts as infected if **any** of the models rates it as infected, and as clear only if **all** of them rate it as clear. It is reported as `union_analyzed`, `union_infected`, `union_clear` and `union_pct_infected`, computed the same way as above. In other words, `union_infected = spore_infected + hyphal_infected - (sub-images infected by both)`, so the union is the proportion of the leaf area showing sporulation, hyphae or both. Since both models are run on the same images and leaf mask, they rate exactly the same sub-images.
+
+Experiments where a model has not been run yet are included with that model's (and the union's) columns left empty.

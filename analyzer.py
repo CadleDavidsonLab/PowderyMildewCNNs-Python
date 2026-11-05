@@ -196,22 +196,26 @@ def classify_subimages(sess, subimgs, focus, out_pos, batch_size):
     return result_map
 
 
-def inference_worker(model, device_id, batch_size, n_loaders, task_q, result_q):
+def infected_output_index(sess):
+    # NOTE: TEMPORARY SOLUTION!!!
+    # Find out which score in output tensor is the infected label!
+    # Run a black image and take lowest prob as "Infected"
+    im_black = np.zeros([1, 3, SUBIMAGE_HEIGHT, SUBIMAGE_WIDTH], dtype=np.float32)
+    pred = sess.run([sess.get_outputs()[0].name], {sess.get_inputs()[0].name: im_black})[0][0]
+    return int(np.argmin(pred))
+
+
+def inference_worker(models, device_id, batch_sizes, n_loaders, task_q, result_q):
     """
         Runs in its own process, one per device. Loader threads read and mask the next images
         (CPU work) while the main thread keeps the device busy classifying sub-images.
-        Sends ("result", task, score_map) per sample, then ("done", device_id, None), or
-        ("error", device_id, traceback_str) if anything fails.
+        Every image is loaded and masked once and its sub-images are classified by all the models.
+        Sends ("result", task, [score_map per model]) per sample, then ("done", device_id, None),
+        or ("error", device_id, traceback_str) if anything fails.
     """
     try:
-        sess = create_session(model, device_id)
-
-        # NOTE: TEMPORARY SOLUTION!!!
-        # Find out which score in output tensor is the infected label!
-        # Run a black image and take lowest prob as "Infected"
-        im_black = np.zeros([1, 3, SUBIMAGE_HEIGHT, SUBIMAGE_WIDTH], dtype=np.float32)
-        pred = sess.run([sess.get_outputs()[0].name], {sess.get_inputs()[0].name: im_black})[0][0]
-        infected_prob_idx = int(np.argmin(pred))
+        sessions = [create_session(model, device_id) for model in models]
+        infected_idxs = [infected_output_index(sess) for sess in sessions]
 
         # Bounded so loaders stay only a few images ahead (each image is ~100s of MB in memory)
         prepared_q = queue.Queue(maxsize=n_loaders)
@@ -239,31 +243,55 @@ def inference_worker(model, device_id, batch_size, n_loaders, task_q, result_q):
             task, prepared = item
             if isinstance(prepared, str):
                 raise RuntimeError("Failed processing '"+task[-1]+"':\n"+prepared)
-            result_map = None if prepared is None else classify_subimages(sess, *prepared, infected_prob_idx, batch_size)
-            result_q.put(("result", task, result_map))
+            result_maps = [None if prepared is None else classify_subimages(sess, *prepared, idx, bs)
+                           for sess, idx, bs in zip(sessions, infected_idxs, batch_sizes)]
+            result_q.put(("result", task, result_maps))
 
         result_q.put(("done", device_id, None))
     except Exception:
         result_q.put(("error", device_id, traceback.format_exc()))
 
 
+class ExperimentError(Exception):
+    # Experiment folder does not have the expected structure (message is shown to the user)
+    pass
+
+
+def parse_timepoint(folder_name):
+    # Timepoint folders are named MM-DD-YYYY or MM-DD-YYYY_<anything>. Returns None if not.
+    try:
+        return datetime.strptime(folder_name.split("_")[0], '%m-%d-%Y')
+    except ValueError:
+        return None
+
+
 def get_expdata(expdir):
+    """
+        Lists the sample images of an experiment folder (timepoint/tray/sample.png).
+        Raises ExperimentError with a user-readable message if the folder structure is wrong.
+    """
     n_images = 0
     img_files = {}
     results = {}
 
     expdir = Path(expdir)
 
-    datefolders = [f for f in os.scandir(expdir) if f.is_dir()]
+    # Hidden folders (e.g. created by the OS) are ignored
+    datefolders = [f for f in os.scandir(expdir) if f.is_dir() and not f.name.startswith(".")]
+
+    hint = ""
+    if parse_timepoint(expdir.name) is not None:
+        hint = (f"\n\n'{expdir.name}' looks like a timepoint folder. "
+                f"Select the experiment folder that contains it instead:\n{expdir.parent}")
 
     if len(datefolders) == 0:
-        print(herror+"Experiment folder does not have any timepoint sub-folder!")
-        return None
+        raise ExperimentError(f"'{expdir}' does not have any timepoint sub-folder." + hint)
 
-    date_list = []
-    for d in datefolders:
-        date_str = d.name.split("_")[0]
-        date_list.append(datetime.strptime(date_str, '%m-%d-%Y'))
+    date_list = [parse_timepoint(d.name) for d in datefolders]
+    wrong = [d.name for d, date in zip(datefolders, date_list) if date is None]
+    if wrong:
+        raise ExperimentError("These sub-folders are not timepoint folders named MM-DD-YYYY or MM-DD-YYYY_<anything>:\n"
+                              + "\n".join("  " + w for w in sorted(wrong)[:10]) + hint)
 
     ind_dates = [i for i, x in sorted(enumerate(date_list), key=lambda x: x[1])]
     datefolders = [datefolders[i] for i in ind_dates]
@@ -272,7 +300,7 @@ def get_expdata(expdir):
         img_files[d.name] = {}
         results[d.name] = {}
 
-        trayfolders = [f for f in os.scandir(d) if f.is_dir()]
+        trayfolders = [f for f in os.scandir(d) if f.is_dir() and not f.name.startswith(".")]
         if len(trayfolders) == 0:
             continue
 
@@ -282,11 +310,21 @@ def get_expdata(expdir):
             img_files[d.name][t.name] = [None]*N_SAMPLES_X_TRAY
             results[d.name][t.name] = [None]*N_SAMPLES_X_TRAY
 
-            imagefiles = [f for f in os.scandir(t) if f.name.endswith(".png")]
+            # Hidden files are skipped (e.g. macOS "._" metadata files on external drives)
+            imagefiles = [f for f in os.scandir(t) if f.name.endswith(".png") and not f.name.startswith(".")]
             for i in imagefiles:
-                nsample = int(i.name.split('-')[0])
+                try:
+                    nsample = int(i.name.split('-')[0])
+                except ValueError:
+                    nsample = 0
+                if not 1 <= nsample <= N_SAMPLES_X_TRAY:
+                    raise ExperimentError(f"Image '{d.name}/{t.name}/{i.name}' does not start with a sample number "
+                                          f"between 1 and {N_SAMPLES_X_TRAY} followed by '-'.")
                 img_files[d.name][t.name][nsample-1] = i.name
                 n_images += 1
+
+    if n_images == 0:
+        raise ExperimentError(f"No sample images (.png) found in the tray folders of '{expdir}'." + hint)
 
     exp_data = {}
     exp_data["name"] = expdir.parts[-1]
@@ -297,11 +335,12 @@ def get_expdata(expdir):
     return exp_data
 
 
-def run_analysis(expdata, model_path, devices, batch_size, n_loaders, etc_str, progress, stop, log_progress=False) -> dict:
+def run_analysis(expdata, model_paths, devices, batch_size, n_loaders, etc_str, progress, stop, log_progress=False) -> list:
     """
-        Analyzes all the experiment images on the given devices (GPU ids, None = CPU). etc_str,
-        progress and stop are single-item lists shared with the caller (e.g. the GUI thread).
-        Returns the results dict, or {} if stopped or failed.
+        Analyzes all the experiment images with every model in model_paths, on the given devices
+        (GPU ids, None = CPU). etc_str, progress and stop are single-item lists shared with the
+        caller (e.g. the GUI thread). Returns one results dict per model (same order as
+        model_paths), or [] if stopped or failed.
     """
     # Every sample image is a task. Tasks are shared by all devices through a queue, so
     # faster devices simply take more of them.
@@ -319,9 +358,15 @@ def run_analysis(expdata, model_path, devices, batch_size, n_loaders, etc_str, p
     progress[0] = 0.0
     samples_done = 0
 
-    model, batchable = load_model(model_path)
-    if not batchable:
-        batch_size = 1
+    models, batch_sizes = [], []
+    for model_path in model_paths:
+        model, batchable = load_model(model_path)
+        models.append(model)
+        batch_sizes.append(batch_size if batchable else 1)
+
+    # One results structure per model: results[timepoint][tray][sample_idx] = (sample_id, score_map)
+    results = [{d: {t: [None]*N_SAMPLES_X_TRAY for t in expdata["samples"][d]} for d in expdata["samples"]}
+               for _ in model_paths]
 
     # "spawn" is the only start method on Windows, set it explicitly to behave the same everywhere
     ctx = mp.get_context("spawn")
@@ -333,10 +378,12 @@ def run_analysis(expdata, model_path, devices, batch_size, n_loaders, etc_str, p
         task_q.put(None)
 
     dev_names = ["CPU" if d is None else "GPU "+str(d) for d in devices]
-    print(f"Analyzing {total_images} images on {', '.join(dev_names)} (batch size {batch_size}, {n_loaders} loaders per device)")
+    model_names = [Path(m).stem for m in model_paths]
+    print(f"Analyzing {total_images} images with {', '.join(model_names)} on {', '.join(dev_names)} "
+          f"(batch size {batch_size}, {n_loaders} loaders per device)")
 
     workers = [ctx.Process(target=inference_worker,
-                           args=(model, d, batch_size, n_loaders, task_q, result_q),
+                           args=(models, d, batch_sizes, n_loaders, task_q, result_q),
                            daemon=True)
                for d in devices]
     for w in workers:
@@ -348,26 +395,27 @@ def run_analysis(expdata, model_path, devices, batch_size, n_loaders, etc_str, p
         while finished_workers < len(workers):
             if stop[0]:
                 stop[0] = False
-                return {}
+                return []
 
             try:
-                kind, info, result_map = result_q.get(timeout=0.5)
+                kind, info, payload = result_q.get(timeout=0.5)
             except queue.Empty:
                 if not any(w.is_alive() for w in workers):
                     print(herror+"Analysis workers exited unexpectedly!")
-                    return {}
+                    return []
                 continue
 
             if kind == "error":
-                print(herror+"Analysis failed on "+("CPU" if info is None else "GPU "+str(info))+":\n"+result_map)
-                return {}
+                print(herror+"Analysis failed on "+("CPU" if info is None else "GPU "+str(info))+":\n"+payload)
+                return []
             if kind == "done":
                 finished_workers += 1
                 continue
 
-            # Store result tuple of (sample_id_str, score_map)
+            # Store result tuple of (sample_id_str, score_map) for each model
             date, tray, sample_idx, sample, _ = info
-            expdata["results"][date][tray][sample_idx] = (os.path.splitext(sample)[0], result_map)
+            for model_results, result_map in zip(results, payload):
+                model_results[date][tray][sample_idx] = (os.path.splitext(sample)[0], result_map)
             samples_done += 1
 
             # Estimated time to completion from the overall throughput (samples run in parallel)
@@ -386,14 +434,19 @@ def run_analysis(expdata, model_path, devices, batch_size, n_loaders, etc_str, p
             w.join()
 
     print(f"Analysis time: {time.time() - t_start:.1f} s")
-    return expdata["results"]
+    return results
 
 
-def save_results(expdata):
+def results_filename(model_path):
+    # Results file of a model in headless mode, e.g. results_SporeNet3.msgpack
+    return "results_" + Path(model_path).stem + ".msgpack"
+
+
+def save_results(expdata, results, filename=RESULTS_FILENAME):
     # Write results to msgpack file
-    out_path = Path(expdata["path"]) / RESULTS_FILENAME
+    out_path = Path(expdata["path"]) / filename
     with open(out_path, "wb") as outfile:
-        packed = msgpack.packb(expdata["results"])
+        packed = msgpack.packb(results)
         outfile.write(packed)
     return out_path
 
@@ -627,12 +680,13 @@ class CNNAnalyzerGUI(tk.Frame if tk else object):
 
     def _load_experiment(self, expdir):
 
-        self._expdata = get_expdata(expdir)
-
-        if self._expdata is None:
+        try:
+            self._expdata = get_expdata(expdir)
+        except ExperimentError as e:
             self._clear_expdata()
+            messagebox.showerror(title="Invalid experiment folder", message=str(e))
             return
-        
+
         # Check how many unique trays
         unique_trays = {}
         for d in self._expdata["samples"]:
@@ -666,7 +720,7 @@ class CNNAnalyzerGUI(tk.Frame if tk else object):
         self._bt_stop["state"] = tk.NORMAL
         
         self._tprocess = ReturnableThread(target=run_analysis, args=(self._expdata,
-                                                                            self._model_path,
+                                                                            [self._model_path],
                                                                             self._devices,
                                                                             self._batch_size,
                                                                             self._n_loaders,
@@ -697,8 +751,8 @@ class CNNAnalyzerGUI(tk.Frame if tk else object):
 
             if len(self._tprocess.result):
                 print("COMPLETED!")
-                self._expdata["results"] = self._tprocess.result
-                save_results(self._expdata)
+                self._expdata["results"] = self._tprocess.result[0]
+                save_results(self._expdata, self._expdata["results"])
             else:
                 print("Cancelled!!")
             self._tprocess = None
@@ -708,21 +762,31 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Blackbird Samples Analyzer")
     parser.add_argument(
-        "model",
+        "models",
         metavar="<ONNX_MODEL>",
-        help="Path to ONNX classification model used for the analysis",
+        nargs="+",
+        help="Path to ONNX classification model(s) used for the analysis. Several models (e.g. the "
+             "sporulation and hyphal ones) can be given with --exp/--repo, each image is then loaded once.",
     )
     parser.add_argument(
         "-e", "--exp",
         metavar="<EXP_DIR>",
         nargs="+",
+        default=[],
         help="Experiment folder(s) to analyze without the GUI (e.g. on a Linux HPC node). "
-             "Results are written to <EXP_DIR>/" + RESULTS_FILENAME,
+             "Results are written to <EXP_DIR>/results_<MODEL_NAME>.msgpack",
+    )
+    parser.add_argument(
+        "-r", "--repo",
+        metavar="<REPO_DIR>",
+        nargs="+",
+        default=[],
+        help="Folder(s) containing experiment folders: every experiment inside is analyzed without the GUI",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="With --exp, overwrite existing results instead of skipping the experiment",
+        help="With --exp/--repo, redo models that already have results instead of skipping them",
     )
     parser.add_argument(
         "-g", "--gpus",
@@ -772,12 +836,17 @@ if __name__ == "__main__":
         print(herror + " Batch size and number of loaders must be at least 1!")
         exit(1)
 
-    if not os.path.exists(args.model):
-        print(herror + " Specified model path " + args.model + " does not exist!")
-        exit(1)
+    for model in args.models:
+        if not os.path.exists(model):
+            print(herror + " Specified model path " + model + " does not exist!")
+            exit(1)
 
-    if os.path.splitext(args.model)[-1] != ".onnx":
-        print(herror + " The specified model " + args.model + " is not in ONNX format!")
+        if os.path.splitext(model)[-1] != ".onnx":
+            print(herror + " The specified model " + model + " is not in ONNX format!")
+            exit(1)
+
+    if len({Path(m).stem for m in args.models}) != len(args.models):
+        print(herror + " Models must have different file names, they are used to name the results files!")
         exit(1)
 
     if devices != [None] and gpu_backend() is None:
@@ -786,34 +855,50 @@ if __name__ == "__main__":
         exit(1)
 
     # ---------- Headless mode ----------
-    if args.exp:
+    expdirs = list(args.exp)
+    for repo in args.repo:
+        if not os.path.isdir(repo):
+            print(herror + " Repository folder " + repo + " does not exist!")
+            exit(1)
+        expdirs += sorted(f.path for f in os.scandir(repo) if f.is_dir() and not f.name.startswith("."))
+
+    if expdirs:
         failed = []
-        for expdir in args.exp:
-            print(f"\n=== {expdir} ===")
-            if os.path.exists(Path(expdir) / RESULTS_FILENAME) and not args.overwrite:
-                print(hwarning + "Experiment already has results, skipping it (use --overwrite to redo it).")
+        for i, expdir in enumerate(expdirs):
+            print(f"\n=== [{i+1}/{len(expdirs)}] {expdir} ===")
+
+            # Only run the models that don't have results yet, so an interrupted run can be resumed
+            todo = [m for m in args.models if args.overwrite or not os.path.exists(Path(expdir) / results_filename(m))]
+            if not todo:
+                print(hwarning + "Experiment already has results for all models, skipping it (use --overwrite to redo it).")
                 continue
-            expdata = get_expdata(expdir)
-            if expdata is None or expdata["nimages"] == 0:
-                print(herror + "No sample images found in " + expdir)
+
+            try:
+                expdata = get_expdata(expdir)
+            except ExperimentError as e:
+                print(herror + str(e))
                 failed.append(expdir)
                 continue
-            results = run_analysis(expdata, args.model, devices, args.batch_size, args.loaders,
+            results = run_analysis(expdata, todo, devices, args.batch_size, args.loaders,
                                    ["00:00:00"], [0.0], [False], log_progress=True)
             if not results:
                 failed.append(expdir)
                 continue
-            expdata["results"] = results
-            print("Results saved to", save_results(expdata))
+            for model, model_results in zip(todo, results):
+                print("Results saved to", save_results(expdata, model_results, results_filename(model)))
 
         if failed:
-            print(herror + "Analysis failed for: " + ", ".join(failed))
+            print(herror + f"Analysis failed for {len(failed)} of {len(expdirs)} experiments:\n  " + "\n  ".join(failed))
             exit(1)
         exit(0)
 
     # ---------- GUI mode ----------
     if tk is None:
-        print(herror + " Tkinter is not available on this system, use --exp to run without the GUI.")
+        print(herror + " Tkinter is not available on this system, use --exp or --repo to run without the GUI.")
+        exit(1)
+
+    if len(args.models) > 1:
+        print(herror + " The GUI analyzes one model at a time, use --exp or --repo to run several models at once.")
         exit(1)
 
     win = tk.Tk()
@@ -822,5 +907,5 @@ if __name__ == "__main__":
     win.title("Blackbird Samples Analyzer")
     win.resizable(False, False)
 
-    app = CNNAnalyzerGUI(win, args.model, devices, args.batch_size, args.loaders)
+    app = CNNAnalyzerGUI(win, args.models[0], devices, args.batch_size, args.loaders)
     win.mainloop()

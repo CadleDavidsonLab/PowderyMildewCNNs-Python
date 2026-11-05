@@ -175,3 +175,6 @@ cython_debug/
 
 # macOS Finder metadata
 .DS_Store
+test/123-DVIT2923_WEOL1607.png
+test/309-DVIT2301_WEOW0706.png
+.vscode/settings.json
